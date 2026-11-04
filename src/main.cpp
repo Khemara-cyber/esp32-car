@@ -812,6 +812,8 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
 
     let activeMode = 'manual';
     let busy = false;
+    let pendingDrive = null;
+    let driveError = false;
     let stickState = { active: false, x: 0, y: 0 };
     let keys = new Set();
 
@@ -868,32 +870,43 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
     }
 
     function updateDrive(left, right) {
-      if (busy) return;
-      busy = true;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 550);
+      pendingDrive = { left, right, mode: activeMode };
+      sendPendingDrive();
+    }
 
-      fetch('/drive?l=' + Math.round(left) + '&r=' + Math.round(right) + '&m=' + activeMode, {
+    function sendPendingDrive() {
+      if (busy || !pendingDrive) return;
+      busy = true;
+      const command = pendingDrive;
+      pendingDrive = null;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 400);
+
+      fetch('/drive?l=' + Math.round(command.left) + '&r=' + Math.round(command.right) + '&m=' + command.mode, {
         cache: 'no-store',
         signal: controller.signal
       })
       .then(resp => resp.text())
       .then(text => {
         if (text && text.trim() === 'OK') {
+          driveError = false;
           status.textContent = 'Connected - motors active';
           status.className = 'status';
         } else {
+          driveError = true;
           status.textContent = 'Command rejected';
           status.className = 'status danger';
         }
       })
       .catch(() => {
+        driveError = true;
         status.textContent = 'Connection problem - motors should stop';
         status.className = 'status danger';
       })
       .finally(() => {
         clearTimeout(timeout);
         busy = false;
+        sendPendingDrive();
       });
     }
 
@@ -1004,7 +1017,7 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
           }
           if (typeof data.distance === 'number') obstacleValue.textContent = data.distance + ' cm';
           if (data.mode) modeValue.textContent = data.mode === 'line' ? 'Line' : data.mode.charAt(0).toUpperCase() + data.mode.slice(1);
-          if (data.status) {
+          if (data.status && (data.warn || !driveError)) {
             status.textContent = data.status;
             status.className = 'status ' + (data.warn ? 'warning' : '');
           }
@@ -1014,7 +1027,7 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
       if (!document.hidden) {
         sendCurrentAxes();
       }
-    }, 500);
+    }, 250);
 
     speedValue.textContent = speed.value;
     setMode('manual');
