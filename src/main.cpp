@@ -5,9 +5,10 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_arduino_version.h>
+#include "wifi_credentials.h"
 
-// Change only this ID for each car
-// 1 = Leader, 2 = Follower, 3 = Follower
+// Flash the same firmware to every car and change only this ID.
+// 1 = Explorer, 2 = Mapper / Observer, 3 = Coordinator / Support
 #define ROBOT_ID 1
 
 #if ROBOT_ID < 1 || ROBOT_ID > 3
@@ -25,10 +26,13 @@ const int ENB = 32;
 
 // Settings
 const int RADIO_CHANNEL = 1;
+const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 const uint32_t CONTROL_TIMEOUT_MS = 800;
 const uint32_t RADIO_INTERVAL_MS = 100;
+const uint32_t TELEMETRY_INTERVAL_MS = 500;
 
-const char *AP_NAME = "SWARM-X-Control";
+// Car 3 exposes this network for the operator while also joining home Wi-Fi.
+const char *AP_NAME = "SWARM-X";
 const char *AP_PASSWORD = "swarmx12345";
 
 // ESP-NOW
@@ -51,15 +55,17 @@ const bool ULTRASONIC_SERIAL_TEST = false;
 const bool BATTERY_MONITOR_ENABLED = false;
 const float BATTERY_DIVIDER_RATIO = 3.0f;
 const float BATTERY_LOW_VOLTAGE = 10.5f;
-const int OBSTACLE_DISTANCE_CM = 45;
-const int OBSTACLE_CLEAR_DISTANCE_CM = 55;
-const int MAX_AVOIDANCE_ATTEMPTS = 2;
-const int AVOIDANCE_REVERSE_SPEED = 120;
-const int AVOIDANCE_TURN_SPEED = 120;
-const uint32_t AVOIDANCE_STOP_MS = 200;
-const uint32_t AVOIDANCE_REVERSE_MS = 600;
-const uint32_t AVOIDANCE_TURN_STOP_MS = 150;
-const uint32_t AVOIDANCE_TURN_MS = 600;
+// Conservative Explorer settings for a fixed, front-facing ultrasonic sensor.
+// Stop before the requested 20-30 cm range to leave braking margin.
+const int OBSTACLE_DISTANCE_CM = 35;
+const int OBSTACLE_CLEAR_DISTANCE_CM = 60;
+const int AVOIDANCE_REVERSE_SPEED = 90;
+const int AVOIDANCE_TURN_SPEED = 95;
+const uint32_t AVOIDANCE_STOP_MS = 250;
+const uint32_t AVOIDANCE_REVERSE_MS = 350;
+const uint32_t AVOIDANCE_SETTLE_MS = 200;
+// Calibrate this on the real floor so this is close to a 90-degree turn.
+const uint32_t AVOIDANCE_TURN_90_MS = 360;
 const uint32_t MOTOR_RAMP_INTERVAL_MS = 20;
 const int MOTOR_ACCEL_STEP = 5;
 const int MOTOR_BRAKE_STEP = 20;
@@ -69,7 +75,26 @@ enum RobotMode
   MODE_MANUAL = 0,
   MODE_AVOID = 1,
   MODE_IDLE = 2,
-  MODE_LINEFOLLOW = 3
+  MODE_LINEFOLLOW = 3,
+  MODE_EXPLORE = 4,
+  MODE_MAP = 5,
+  MODE_COORDINATE = 6
+};
+
+enum RobotRole
+{
+  ROLE_EXPLORER = 1,
+  ROLE_MAPPER = 2,
+  ROLE_COORDINATOR = 3
+};
+
+const RobotRole ROBOT_ROLE = static_cast<RobotRole>(ROBOT_ID);
+const bool IS_COORDINATOR = ROBOT_ROLE == ROLE_COORDINATOR;
+
+enum PacketType
+{
+  PACKET_COMMAND = 1,
+  PACKET_TELEMETRY = 2
 };
 
 enum AvoidancePhase
@@ -77,8 +102,11 @@ enum AvoidancePhase
   AVOIDANCE_READY,
   AVOIDANCE_STOPPING,
   AVOIDANCE_REVERSING,
-  AVOIDANCE_TURN_STOPPING,
-  AVOIDANCE_TURNING,
+  AVOIDANCE_SCAN_LEFT,
+  AVOIDANCE_READ_LEFT,
+  AVOIDANCE_SCAN_RIGHT,
+  AVOIDANCE_READ_RIGHT,
+  AVOIDANCE_CHOOSE_PATH,
   AVOIDANCE_LOCKED
 };
 
@@ -90,16 +118,37 @@ int lastObstacleDistanceCm = 999;
 int lastLineTurn = 0;
 AvoidancePhase avoidancePhase = AVOIDANCE_READY;
 uint32_t avoidancePhaseStartedAt = 0;
-int avoidanceAttempts = 0;
-int avoidanceTurnDirection = 1;
+int leftScanDistanceCm = 0;
+int rightScanDistanceCm = 0;
 
-// Wireless packet
+// ESP-NOW protocol. Commands originate only from Car 3; every car broadcasts
+// telemetry so the coordinator can see the team's observations.
+struct __attribute__((packed)) PacketHeader
+{
+  uint32_t magic;
+  uint8_t type;
+  uint8_t source;
+};
+
 struct __attribute__((packed)) DrivePacket
 {
   uint32_t magic;
+  uint8_t type;
   uint8_t source;
   int16_t left;
   int16_t right;
+  uint8_t mode;
+};
+
+struct __attribute__((packed)) TelemetryPacket
+{
+  uint32_t magic;
+  uint8_t type;
+  uint8_t source;
+  uint8_t role;
+  uint16_t distanceCm;
+  uint8_t blocked;
+  uint32_t uptimeMs;
 };
 
 // Motor variables
@@ -111,10 +160,21 @@ int16_t appliedRight = 0;
 
 volatile int16_t receivedLeft = 0;
 volatile int16_t receivedRight = 0;
+volatile RobotMode receivedMode = MODE_IDLE;
 volatile uint32_t receivedAt = 0;
+
+struct TeamObservation
+{
+  uint16_t distanceCm;
+  bool blocked;
+  uint32_t receivedAt;
+};
+
+TeamObservation teamObservations[4] = {};
 
 uint32_t lastBrowserCommand = 0;
 uint32_t lastRadioSend = 0;
+uint32_t lastTelemetrySend = 0;
 
 portMUX_TYPE receiveMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -211,29 +271,68 @@ void driveImmediately(int left, int right)
 // Receive ESP-NOW messages
 void processPacket(const uint8_t *data, int length)
 {
-
-  if (ROBOT_ID == 1 ||
-      length != sizeof(DrivePacket))
+  if (length < static_cast<int>(sizeof(PacketHeader)))
   {
     return;
   }
 
-  DrivePacket packet;
-  memcpy(&packet, data, sizeof(packet));
+  PacketHeader header;
+  memcpy(&header, data, sizeof(header));
 
-  if (packet.magic != PACKET_MAGIC ||
-      packet.source != 1)
+  if (header.magic != PACKET_MAGIC || header.source < 1 || header.source > 3)
   {
     return;
   }
 
-  portENTER_CRITICAL(&receiveMux);
+  if (header.type == PACKET_COMMAND &&
+      !IS_COORDINATOR &&
+      header.source == ROLE_COORDINATOR &&
+      length == static_cast<int>(sizeof(DrivePacket)))
+  {
+    DrivePacket packet;
+    memcpy(&packet, data, sizeof(packet));
 
-  receivedLeft = constrain(packet.left, -255, 255);
-  receivedRight = constrain(packet.right, -255, 255);
-  receivedAt = millis();
+    if (packet.mode > MODE_COORDINATE)
+    {
+      return;
+    }
 
-  portEXIT_CRITICAL(&receiveMux);
+    portENTER_CRITICAL(&receiveMux);
+    receivedLeft = constrain(packet.left, -255, 255);
+    receivedRight = constrain(packet.right, -255, 255);
+    receivedMode = static_cast<RobotMode>(packet.mode);
+    receivedAt = millis();
+    portEXIT_CRITICAL(&receiveMux);
+    return;
+  }
+
+  if (header.type == PACKET_TELEMETRY &&
+      IS_COORDINATOR &&
+      header.source != ROBOT_ID &&
+      length == static_cast<int>(sizeof(TelemetryPacket)))
+  {
+    TelemetryPacket packet;
+    memcpy(&packet, data, sizeof(packet));
+
+    portENTER_CRITICAL(&receiveMux);
+    teamObservations[packet.source].distanceCm = packet.distanceCm;
+    teamObservations[packet.source].blocked = packet.blocked != 0;
+    teamObservations[packet.source].receivedAt = millis();
+    portEXIT_CRITICAL(&receiveMux);
+  }
+}
+
+String roleToString(RobotRole role)
+{
+  switch (role)
+  {
+    case ROLE_EXPLORER:
+      return "Explorer";
+    case ROLE_MAPPER:
+      return "Mapper";
+    default:
+      return "Coordinator";
+  }
 }
 
 float readBatteryVoltage()
@@ -285,6 +384,21 @@ RobotMode parseMode(const String &modeText)
     return MODE_LINEFOLLOW;
   }
 
+  if (modeText == "explore")
+  {
+    return MODE_EXPLORE;
+  }
+
+  if (modeText == "map")
+  {
+    return MODE_MAP;
+  }
+
+  if (modeText == "coordinate")
+  {
+    return MODE_COORDINATE;
+  }
+
   return MODE_MANUAL;
 }
 
@@ -298,9 +412,54 @@ String modeToString(RobotMode mode)
       return "idle";
     case MODE_LINEFOLLOW:
       return "line";
+    case MODE_EXPLORE:
+      return "explore";
+    case MODE_MAP:
+      return "map";
+    case MODE_COORDINATE:
+      return "coordinate";
     default:
       return "manual";
   }
+}
+
+void followLine();
+
+// A role mode gives each car a safe default task without pretending that a
+// single front distance sensor can produce a full SLAM map or localization.
+// Manual, Avoid and Line modes remain available for calibration and testing.
+void applyRoleMode(RobotMode mode, int requestedLeft, int requestedRight)
+{
+  if (mode == MODE_EXPLORE)
+  {
+    if (ROBOT_ROLE == ROLE_EXPLORER)
+    {
+      targetLeft = 165;
+      targetRight = 165;
+    }
+    else
+    {
+      targetLeft = 0;
+      targetRight = 0;
+    }
+    return;
+  }
+
+  if (mode == MODE_MAP || mode == MODE_COORDINATE || mode == MODE_IDLE)
+  {
+    targetLeft = 0;
+    targetRight = 0;
+    return;
+  }
+
+  if (mode == MODE_LINEFOLLOW)
+  {
+    followLine();
+    return;
+  }
+
+  targetLeft = requestedLeft;
+  targetRight = requestedRight;
 }
 
 String avoidancePhaseToString()
@@ -311,12 +470,16 @@ String avoidancePhaseToString()
       return "Stopping for obstacle";
     case AVOIDANCE_REVERSING:
       return "Reversing from obstacle";
-    case AVOIDANCE_TURN_STOPPING:
-      return "Pausing before turn";
-    case AVOIDANCE_TURNING:
-      return "Turning to avoid obstacle";
+    case AVOIDANCE_SCAN_LEFT:
+    case AVOIDANCE_READ_LEFT:
+      return "Scanning left path";
+    case AVOIDANCE_SCAN_RIGHT:
+    case AVOIDANCE_READ_RIGHT:
+      return "Scanning right path";
+    case AVOIDANCE_CHOOSE_PATH:
+      return "Choosing clear path";
     case AVOIDANCE_LOCKED:
-      return "Blocked - release controls or clear path";
+      return "Blocked - no safe direction";
     default:
       return "Ready";
   }
@@ -373,17 +536,13 @@ void followLine()
 void applyObstacleAvoidance(uint32_t now, int requestedLeft, int requestedRight)
 {
   bool forwardRequested = (requestedLeft + requestedRight) > 0;
-  bool obstacleClose = lastObstacleDistanceCm > 0 &&
-                       lastObstacleDistanceCm < OBSTACLE_DISTANCE_CM;
-  bool pathClear = lastObstacleDistanceCm >= OBSTACLE_CLEAR_DISTANCE_CM;
-  bool recoveryStillBlocked = avoidanceAttempts > 0 &&
-                              !pathClear &&
-                              lastObstacleDistanceCm < 999;
+  bool readingValid = lastObstacleDistanceCm >= 2 && lastObstacleDistanceCm <= 400;
+  bool obstacleClose = !readingValid || lastObstacleDistanceCm <= OBSTACLE_DISTANCE_CM;
+  bool pathClear = readingValid && lastObstacleDistanceCm >= OBSTACLE_CLEAR_DISTANCE_CM;
 
   if (!forwardRequested)
   {
     avoidancePhase = AVOIDANCE_READY;
-    avoidanceAttempts = 0;
     targetLeft = requestedLeft;
     targetRight = requestedRight;
     return;
@@ -391,44 +550,16 @@ void applyObstacleAvoidance(uint32_t now, int requestedLeft, int requestedRight)
 
   if (avoidancePhase == AVOIDANCE_LOCKED)
   {
-    if (pathClear)
-    {
-      avoidancePhase = AVOIDANCE_READY;
-      avoidanceAttempts = 0;
-    }
-    else
-    {
-      targetLeft = 0;
-      targetRight = 0;
-      return;
-    }
+    targetLeft = 0;
+    targetRight = 0;
+    return;
   }
 
-  if (avoidancePhase == AVOIDANCE_READY)
+  if (avoidancePhase == AVOIDANCE_READY && obstacleClose)
   {
-    if (obstacleClose || recoveryStillBlocked)
-    {
-      if (avoidanceAttempts >= MAX_AVOIDANCE_ATTEMPTS)
-      {
-        avoidancePhase = AVOIDANCE_LOCKED;
-        targetLeft = 0;
-        targetRight = 0;
-        return;
-      }
-
-      ++avoidanceAttempts;
-      avoidancePhase = AVOIDANCE_STOPPING;
-      avoidancePhaseStartedAt = now;
-      avoidanceTurnDirection = (avoidanceAttempts % 2 == 1) ? 1 : -1;
-      Serial.printf("Obstacle at %d cm; recovery attempt %d/%d\n",
-                    lastObstacleDistanceCm,
-                    avoidanceAttempts,
-                    MAX_AVOIDANCE_ATTEMPTS);
-    }
-    else if (pathClear)
-    {
-      avoidanceAttempts = 0;
-    }
+    avoidancePhase = AVOIDANCE_STOPPING;
+    avoidancePhaseStartedAt = now;
+    Serial.printf("Explorer obstacle/no echo at %d cm; stopping to scan\n", lastObstacleDistanceCm);
   }
 
   switch (avoidancePhase)
@@ -448,29 +579,80 @@ void applyObstacleAvoidance(uint32_t now, int requestedLeft, int requestedRight)
       targetRight = -AVOIDANCE_REVERSE_SPEED;
       if (now - avoidancePhaseStartedAt >= AVOIDANCE_REVERSE_MS)
       {
-        avoidancePhase = AVOIDANCE_TURN_STOPPING;
+        avoidancePhase = AVOIDANCE_SCAN_LEFT;
         avoidancePhaseStartedAt = now;
       }
       break;
 
-    case AVOIDANCE_TURN_STOPPING:
+    case AVOIDANCE_SCAN_LEFT:
+      // Rotate left, then let the sensor settle before recording that path.
+      targetLeft = -AVOIDANCE_TURN_SPEED;
+      targetRight = AVOIDANCE_TURN_SPEED;
+      if (now - avoidancePhaseStartedAt >= AVOIDANCE_TURN_90_MS)
+      {
+        avoidancePhase = AVOIDANCE_READ_LEFT;
+        avoidancePhaseStartedAt = now;
+      }
+      break;
+
+    case AVOIDANCE_READ_LEFT:
       targetLeft = 0;
       targetRight = 0;
-      if (now - avoidancePhaseStartedAt >= AVOIDANCE_TURN_STOP_MS)
+      if (now - avoidancePhaseStartedAt >= AVOIDANCE_SETTLE_MS)
       {
-        avoidancePhase = AVOIDANCE_TURNING;
+        leftScanDistanceCm = pathClear ? lastObstacleDistanceCm : 0;
+        avoidancePhase = AVOIDANCE_SCAN_RIGHT;
         avoidancePhaseStartedAt = now;
       }
       break;
 
-    case AVOIDANCE_TURNING:
-      targetLeft = -avoidanceTurnDirection * AVOIDANCE_TURN_SPEED;
-      targetRight = avoidanceTurnDirection * AVOIDANCE_TURN_SPEED;
-      if (now - avoidancePhaseStartedAt >= AVOIDANCE_TURN_MS)
+    case AVOIDANCE_SCAN_RIGHT:
+      // From left-facing, turn through the original heading to right-facing.
+      targetLeft = AVOIDANCE_TURN_SPEED;
+      targetRight = -AVOIDANCE_TURN_SPEED;
+      if (now - avoidancePhaseStartedAt >= AVOIDANCE_TURN_90_MS * 2)
       {
+        avoidancePhase = AVOIDANCE_READ_RIGHT;
+        avoidancePhaseStartedAt = now;
+      }
+      break;
+
+    case AVOIDANCE_READ_RIGHT:
+      targetLeft = 0;
+      targetRight = 0;
+      if (now - avoidancePhaseStartedAt >= AVOIDANCE_SETTLE_MS)
+      {
+        rightScanDistanceCm = pathClear ? lastObstacleDistanceCm : 0;
+        avoidancePhase = AVOIDANCE_CHOOSE_PATH;
+        avoidancePhaseStartedAt = now;
+      }
+      break;
+
+    case AVOIDANCE_CHOOSE_PATH:
+      if (leftScanDistanceCm == 0 && rightScanDistanceCm == 0)
+      {
+        avoidancePhase = AVOIDANCE_LOCKED;
         targetLeft = 0;
         targetRight = 0;
+      }
+      else if (rightScanDistanceCm >= leftScanDistanceCm)
+      {
+        // Already facing the clearer right path.
         avoidancePhase = AVOIDANCE_READY;
+        targetLeft = 0;
+        targetRight = 0;
+      }
+      else
+      {
+        // Return from right-facing to the clearer left path.
+        targetLeft = -AVOIDANCE_TURN_SPEED;
+        targetRight = AVOIDANCE_TURN_SPEED;
+        if (now - avoidancePhaseStartedAt >= AVOIDANCE_TURN_90_MS * 2)
+        {
+          avoidancePhase = AVOIDANCE_READY;
+          targetLeft = 0;
+          targetRight = 0;
+        }
       }
       break;
 
@@ -489,11 +671,7 @@ void applyObstacleAvoidance(uint32_t now, int requestedLeft, int requestedRight)
 
 bool avoidanceNeedsImmediateDrive()
 {
-  return avoidancePhase == AVOIDANCE_STOPPING ||
-         avoidancePhase == AVOIDANCE_REVERSING ||
-         avoidancePhase == AVOIDANCE_TURN_STOPPING ||
-         avoidancePhase == AVOIDANCE_TURNING ||
-         avoidancePhase == AVOIDANCE_LOCKED;
+  return avoidancePhase != AVOIDANCE_READY;
 }
 
 // Arduino ESP32 Core 3.x
@@ -742,7 +920,7 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
   <div class="app">
     <div class="header">
       <h1>SWARM-X</h1>
-      <p class="subtitle">Leader + Followers | ESP-NOW</p>
+      <p class="subtitle">Three-Robot Cooperative Mission Control</p>
     </div>
 
     <div class="panel">
@@ -761,6 +939,14 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
           <span class="stat-label">Mode</span>
           <span id="modeValue" class="stat-value">Manual</span>
         </div>
+        <div class="stat">
+          <span class="stat-label">Control car</span>
+          <span id="roleValue" class="stat-value">Coordinator</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Team links</span>
+          <span id="teamValue" class="stat-value">--</span>
+        </div>
       </div>
     </div>
 
@@ -768,6 +954,9 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
       <button class="mode-btn active" data-mode="manual">Manual</button>
       <button class="mode-btn" data-mode="avoid">Avoid</button>
       <button class="mode-btn" data-mode="line">Line</button>
+      <button class="mode-btn" data-mode="explore">Explore</button>
+      <button class="mode-btn" data-mode="map">Map</button>
+      <button class="mode-btn" data-mode="coordinate">Coordinate</button>
       <button class="mode-btn" data-mode="idle">Idle</button>
     </div>
 
@@ -791,9 +980,8 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
 
       <div class="info">
         Drag the joystick or use WASD / Arrow keys.<br>
-        Forward commands in any drive mode stop, reverse, and turn for obstacles under 45 cm.<br>
-        It tries twice, then stays stopped if still blocked.<br>
-        One front sensor cannot check whether the side path is clear.<br>
+        Car 1 stops at 35 cm, reverses slowly, then scans left and right before choosing a path with at least 60 cm clear.<br>
+        If neither direction is clear, it stays stopped and reports blocked.<br>
         Battery cutoff stays disabled until a voltage divider is installed and enabled.
       </div>
     </div>
@@ -806,6 +994,8 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
     const batteryValue = document.getElementById('batteryValue');
     const obstacleValue = document.getElementById('obstacleValue');
     const modeValue = document.getElementById('modeValue');
+    const roleValue = document.getElementById('roleValue');
+    const teamValue = document.getElementById('teamValue');
     const joystickEl = document.getElementById('joystick');
     const stickEl = document.getElementById('stick');
     const modeButtons = [...document.querySelectorAll('.mode-btn')];
@@ -1017,6 +1207,8 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
           }
           if (typeof data.distance === 'number') obstacleValue.textContent = data.distance + ' cm';
           if (data.mode) modeValue.textContent = data.mode === 'line' ? 'Line' : data.mode.charAt(0).toUpperCase() + data.mode.slice(1);
+          if (data.role) roleValue.textContent = data.role;
+          if (data.team) teamValue.textContent = data.team;
           if (data.status && (data.warn || !driveError)) {
             status.textContent = data.status;
             status.className = 'status ' + (data.warn ? 'warning' : '');
@@ -1075,20 +1267,16 @@ void setup()
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, LOW);
 
-  if (ROBOT_ID == 1)
+  // Car 3 is both a visible operator access point and a home-Wi-Fi station.
+  // Cars 1 and 2 join the Car 3 access point.
+  if (IS_COORDINATOR)
   {
-
     WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(false);
 
-    if (!WiFi.softAP(
-            AP_NAME,
-            AP_PASSWORD,
-            RADIO_CHANNEL))
+    if (!WiFi.softAP(AP_NAME, AP_PASSWORD, RADIO_CHANNEL))
     {
-
-      Serial.println("WiFi failed");
-
+      Serial.println("Could not start SWARM-X Wi-Fi; motors remain stopped.");
       while (true)
       {
         drive(0, 0);
@@ -1096,20 +1284,63 @@ void setup()
       }
     }
 
-    Serial.println("WiFi ready");
-    Serial.println(AP_NAME);
+    Serial.printf("Operator Wi-Fi: %s\n", AP_NAME);
+    Serial.print("Dashboard on SWARM-X: http://");
     Serial.println(WiFi.softAPIP());
+
+    if (strlen(HOME_WIFI_SSID) > 0 && strlen(HOME_WIFI_PASSWORD) > 0)
+    {
+      Serial.println("Connecting Car 3 to home Wi-Fi...");
+      WiFi.begin(HOME_WIFI_SSID, HOME_WIFI_PASSWORD);
+      uint32_t connectStartedAt = millis();
+      while (WiFi.status() != WL_CONNECTED &&
+             millis() - connectStartedAt < WIFI_CONNECT_TIMEOUT_MS)
+      {
+        delay(250);
+      }
+
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        Serial.print("Car 3 home-Wi-Fi dashboard: http://");
+        Serial.println(WiFi.localIP());
+      }
+      else
+      {
+        Serial.println("Home Wi-Fi unavailable; SWARM-X operator Wi-Fi remains active.");
+      }
+    }
+    else
+    {
+      Serial.println("Home Wi-Fi credentials missing; SWARM-X operator Wi-Fi remains active.");
+    }
   }
   else
   {
-
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
     WiFi.setSleep(false);
+    WiFi.begin(AP_NAME, AP_PASSWORD);
 
-    esp_wifi_set_channel(
-        RADIO_CHANNEL,
-        WIFI_SECOND_CHAN_NONE);
+    uint32_t connectStartedAt = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - connectStartedAt < WIFI_CONNECT_TIMEOUT_MS)
+    {
+      delay(250);
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      Serial.printf("Car %d joined %s on channel %ld\n",
+                    ROBOT_ID, AP_NAME, static_cast<long>(WiFi.channel()));
+    }
+    else
+    {
+      Serial.println("Could not join SWARM-X Wi-Fi; motors remain stopped.");
+      while (true)
+      {
+        drive(0, 0);
+        delay(1000);
+      }
+    }
   }
 
   // Start ESP-NOW
@@ -1127,8 +1358,8 @@ void setup()
 
   esp_now_register_recv_cb(onReceive);
 
-  // Leader configuration
-  if (ROBOT_ID == 1)
+  // Every robot needs the broadcast peer: Car 3 sends commands and Cars 1/2
+  // return observations on the same ESP-NOW channel.
   {
 
     esp_now_peer_info_t peer = {};
@@ -1138,7 +1369,7 @@ void setup()
         broadcastMac,
         6);
 
-    peer.channel = RADIO_CHANNEL;
+    peer.channel = 0;
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
 
@@ -1154,6 +1385,9 @@ void setup()
       }
     }
 
+    // Only Car 3 exposes mission controls; it is the team's coordinator.
+    if (IS_COORDINATOR)
+    {
     // Web dashboard
     server.on("/", HTTP_GET, []()
               { server.send_P(
@@ -1218,12 +1452,23 @@ void setup()
 
     server.on("/status", HTTP_GET, []()
               {
+                uint32_t now = millis();
+                bool explorerOnline;
+                bool mapperOnline;
+                portENTER_CRITICAL(&receiveMux);
+                explorerOnline = now - teamObservations[ROLE_EXPLORER].receivedAt <= TELEMETRY_INTERVAL_MS * 3;
+                mapperOnline = now - teamObservations[ROLE_MAPPER].receivedAt <= TELEMETRY_INTERVAL_MS * 3;
+                portEXIT_CRITICAL(&receiveMux);
+                String team = String("C1 ") + (explorerOnline ? "online" : "offline") +
+                              ", C2 " + (mapperOnline ? "online" : "offline");
                 String payload = "{\"batteryEnabled\":" +
                                  String(BATTERY_MONITOR_ENABLED ? "true" : "false") +
                                  ",\"battery\":" +
                                  (BATTERY_MONITOR_ENABLED ? String(batteryVoltage, 1) : String("null")) +
                                  ",\"distance\":" + String(lastObstacleDistanceCm) +
                                  ",\"mode\":\"" + modeToString(currentMode) +
+                                 "\",\"role\":\"Coordinator\"" +
+                                 ",\"team\":\"" + team +
                                  "\",\"avoidance\":\"" + avoidancePhaseToString() + "\"";
 
                 if (BATTERY_MONITOR_ENABLED && batteryVoltage < BATTERY_LOW_VOLTAGE)
@@ -1232,7 +1477,7 @@ void setup()
                 }
                 else if (avoidancePhase == AVOIDANCE_LOCKED)
                 {
-                  payload += ",\"warn\":true,\"status\":\"Blocked - release controls or clear path\"";
+                  payload += ",\"warn\":true,\"status\":\"Blocked - no safe direction\"";
                 }
                 else if (avoidancePhase != AVOIDANCE_READY)
                 {
@@ -1254,11 +1499,13 @@ void setup()
                             "Not found"); });
 
     server.begin();
+    }
   }
 
   Serial.printf(
-      "Robot %d ready\n",
-      ROBOT_ID);
+      "Car %d (%s) ready\n",
+      ROBOT_ID,
+      roleToString(ROBOT_ROLE).c_str());
 }
 
 // Main loop
@@ -1280,116 +1527,107 @@ void loop()
     return;
   }
 
-  if (ROBOT_ID == 1)
+  uint32_t now = millis();
+  if (BATTERY_MONITOR_ENABLED)
   {
+    batteryVoltage = readBatteryVoltage();
+  }
+  lastObstacleDistanceCm = readObstacleDistanceCm();
 
-    // Leader
+  int16_t requestedLeft = 0;
+  int16_t requestedRight = 0;
+  RobotMode activeMode = MODE_IDLE;
+
+  if (IS_COORDINATOR)
+  {
     server.handleClient();
+    bool explorerBlocked;
+    portENTER_CRITICAL(&receiveMux);
+    explorerBlocked = teamObservations[ROLE_EXPLORER].blocked;
+    portEXIT_CRITICAL(&receiveMux);
 
-    uint32_t now = millis();
-    if (BATTERY_MONITOR_ENABLED)
+    // A blocked scout is a team event: pause the mission so the coordinator
+    // can select another route instead of allowing overlap or blind motion.
+    if (currentMode == MODE_EXPLORE && explorerBlocked)
     {
-      batteryVoltage = readBatteryVoltage();
-    }
-    lastObstacleDistanceCm = readObstacleDistanceCm();
-
-    // Stop if laptop disconnects
-    if (now - lastBrowserCommand >
-        CONTROL_TIMEOUT_MS)
-    {
-
+      currentMode = MODE_COORDINATE;
       commandedLeft = 0;
       commandedRight = 0;
     }
 
-    if (BATTERY_MONITOR_ENABLED &&
-        batteryVoltage < BATTERY_LOW_VOLTAGE)
+    activeMode = currentMode;
+    if (now - lastBrowserCommand <= CONTROL_TIMEOUT_MS)
     {
-      avoidancePhase = AVOIDANCE_READY;
-      avoidanceAttempts = 0;
-      targetLeft = 0;
-      targetRight = 0;
-    }
-    else if (currentMode == MODE_IDLE)
-    {
-      avoidancePhase = AVOIDANCE_READY;
-      avoidanceAttempts = 0;
-      targetLeft = 0;
-      targetRight = 0;
-    }
-    else if (currentMode == MODE_LINEFOLLOW)
-    {
-      followLine();
-    }
-    else
-    {
-      targetLeft = commandedLeft;
-      targetRight = commandedRight;
+      requestedLeft = commandedLeft;
+      requestedRight = commandedRight;
     }
 
-    if ((!BATTERY_MONITOR_ENABLED || batteryVoltage >= BATTERY_LOW_VOLTAGE) &&
-        currentMode != MODE_IDLE)
+    if (now - lastRadioSend >= RADIO_INTERVAL_MS)
     {
-      int requestedLeft = targetLeft;
-      int requestedRight = targetRight;
-      applyObstacleAvoidance(now, requestedLeft, requestedRight);
-    }
-
-    if (avoidanceNeedsImmediateDrive())
-    {
-      driveImmediately(targetLeft, targetRight);
-    }
-    else
-    {
-      drive(targetLeft, targetRight);
-    }
-
-    // Broadcast commands to followers
-    if (now - lastRadioSend >=
-        RADIO_INTERVAL_MS)
-    {
-
-      DrivePacket packet = {
-          PACKET_MAGIC,
-          1,
-          targetLeft,
-          targetRight};
-
-      esp_now_send(
-          broadcastMac,
-          (uint8_t *)&packet,
-          sizeof(packet));
-
+      DrivePacket packet = {PACKET_MAGIC, PACKET_COMMAND, ROBOT_ID,
+                            requestedLeft, requestedRight,
+                            static_cast<uint8_t>(activeMode)};
+      esp_now_send(broadcastMac, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
       lastRadioSend = now;
     }
   }
   else
   {
-
-    // Follower
-    int16_t left, right;
     uint32_t receivedTime;
-
     portENTER_CRITICAL(&receiveMux);
-
-    left = receivedLeft;
-    right = receivedRight;
+    requestedLeft = receivedLeft;
+    requestedRight = receivedRight;
+    activeMode = receivedMode;
     receivedTime = receivedAt;
-
     portEXIT_CRITICAL(&receiveMux);
 
-    // Stop if leader disconnects
-    if (millis() - receivedTime >
-        CONTROL_TIMEOUT_MS)
+    // A missing coordinator is always a stop, not a continuation of a mission.
+    if (now - receivedTime > CONTROL_TIMEOUT_MS)
     {
+      activeMode = MODE_IDLE;
+      requestedLeft = 0;
+      requestedRight = 0;
+    }
+  }
 
-      drive(0, 0);
+  if (BATTERY_MONITOR_ENABLED && batteryVoltage < BATTERY_LOW_VOLTAGE)
+  {
+    avoidancePhase = AVOIDANCE_READY;
+    targetLeft = 0;
+    targetRight = 0;
+  }
+  else
+  {
+    applyRoleMode(activeMode, requestedLeft, requestedRight);
+    if (activeMode != MODE_IDLE && activeMode != MODE_MAP && activeMode != MODE_COORDINATE)
+    {
+      int requestedRoleLeft = targetLeft;
+      int requestedRoleRight = targetRight;
+      applyObstacleAvoidance(now, requestedRoleLeft, requestedRoleRight);
     }
     else
     {
-
-      drive(left, right);
+      avoidancePhase = AVOIDANCE_READY;
     }
+  }
+
+  if (avoidanceNeedsImmediateDrive())
+  {
+    driveImmediately(targetLeft, targetRight);
+  }
+  else
+  {
+    drive(targetLeft, targetRight);
+  }
+
+  if (now - lastTelemetrySend >= TELEMETRY_INTERVAL_MS)
+  {
+    TelemetryPacket packet = {PACKET_MAGIC, PACKET_TELEMETRY, ROBOT_ID,
+                              static_cast<uint8_t>(ROBOT_ROLE),
+                              static_cast<uint16_t>(constrain(lastObstacleDistanceCm, 0, 999)),
+                              static_cast<uint8_t>(avoidancePhase == AVOIDANCE_LOCKED), now};
+    esp_now_send(broadcastMac, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
+    lastTelemetrySend = now;
   }
 
   delay(5);
