@@ -6,11 +6,13 @@ with a mock /drive endpoint for browser testing.
 """
 
 import http.server
+import json
 import re
 import socketserver
 from urllib.parse import parse_qs, urlparse
 
 PORT = 8080
+current_mode = "manual"
 
 def get_html_from_main():
     with open("src/main.cpp", "r", encoding="utf-8") as f:
@@ -30,6 +32,26 @@ class CarSimulatorHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_CONTENT.encode("utf-8"))
+        elif parsed.path == "/mode":
+            global current_mode
+            current_mode = parse_qs(parsed.query).get("m", ["manual"])[0]
+            print(f"[ESP32 Sim] mode={current_mode}")
+            self.send_text(current_mode)
+        elif parsed.path == "/status":
+            # Fake team data so every dashboard panel has something to show
+            status = {
+                "batteryEnabled": False, "battery": None, "distance": 85,
+                "mode": current_mode, "role": "Coordinator",
+                "c1": {"online": True, "distance": 142, "blocked": False},
+                "c2": {"online": True, "distance": 999, "blocked": False},
+                "c2scan": {"id": 1, "readings": 4, "cm": [120, 40, 999, 75]},
+                "clearCm": 60, "avoidance": "Ready",
+                "warn": False, "status": "Connected - motors active",
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(status).encode("utf-8"))
         elif parsed.path == "/drive":
             params = parse_qs(parsed.query)
             left = params.get("l", ["0"])[0]
@@ -44,6 +66,12 @@ class CarSimulatorHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"Not found")
+
+    def send_text(self, text):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(text.encode("utf-8"))
 
     def log_message(self, format, *args):
         # Suppress default request logging to keep output clean for motor logs

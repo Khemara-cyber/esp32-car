@@ -1,15 +1,26 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <esp_http_server.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_arduino_version.h>
+#include <esp_system.h>
+#include <Preferences.h>
+#include <soc/soc.h>
+#include <soc/rtc_cntl_reg.h>
+
+// Private and git-ignored; without it Car 3 runs only its own SWARM-X network.
+#if __has_include("wifi_credentials.h")
 #include "wifi_credentials.h"
+#else
+#define HOME_WIFI_SSID ""
+#define HOME_WIFI_PASSWORD ""
+#endif
 
 // Flash the same firmware to every car and change only this ID.
 // 1 = Explorer, 2 = Mapper / Observer, 3 = Coordinator / Support
-#define ROBOT_ID 1
+#define ROBOT_ID 2
 
 #if ROBOT_ID < 1 || ROBOT_ID > 3
 #error ROBOT_ID must be 1, 2, or 3
@@ -30,6 +41,9 @@ const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 const uint32_t CONTROL_TIMEOUT_MS = 800;
 const uint32_t RADIO_INTERVAL_MS = 100;
 const uint32_t TELEMETRY_INTERVAL_MS = 500;
+const uint32_t TEAM_TELEMETRY_TIMEOUT_MS = TELEMETRY_INTERVAL_MS * 3;
+// Missions stop when the operator page has been silent this long.
+const uint32_t OPERATOR_TIMEOUT_MS = 2000;
 
 // Car 3 exposes this network for the operator while also joining home Wi-Fi.
 const char *AP_NAME = "SWARM-X";
@@ -42,7 +56,10 @@ uint8_t broadcastMac[6] = {
     0xFF, 0xFF, 0xFF,
     0xFF, 0xFF, 0xFF};
 
-WebServer server(80);
+// Car 3's dashboard. ESP-IDF's server handles several connections at once;
+// Arduino's WebServer stalls up to 5 s on an idle connection that Chrome
+// opens in advance, which made every drive command time out.
+httpd_handle_t httpServer = nullptr;
 
 const int BATTERY_PIN = 34;
 const int ULTRASONIC_TRIG_PIN = 18;
@@ -59,6 +76,9 @@ const float BATTERY_LOW_VOLTAGE = 10.5f;
 // Stop before the requested 20-30 cm range to leave braking margin.
 const int OBSTACLE_DISTANCE_CM = 35;
 const int OBSTACLE_CLEAR_DISTANCE_CM = 60;
+// readObstacleDistanceCm() returns this when no echo comes back in time.
+const int ULTRASONIC_NO_ECHO_CM = 999;
+const int ULTRASONIC_MAX_RANGE_CM = 400;
 const int AVOIDANCE_REVERSE_SPEED = 90;
 const int AVOIDANCE_TURN_SPEED = 95;
 const uint32_t AVOIDANCE_STOP_MS = 250;
@@ -66,6 +86,17 @@ const uint32_t AVOIDANCE_REVERSE_MS = 350;
 const uint32_t AVOIDANCE_SETTLE_MS = 200;
 // Calibrate this on the real floor so this is close to a 90-degree turn.
 const uint32_t AVOIDANCE_TURN_90_MS = 360;
+const int EXPLORE_SPEED = 165;
+// Car 3 follows Car 1 in Explore mode. Calibrate on the real floor:
+// FOLLOW_MIN_SPEED must be enough to get the car moving.
+const int FOLLOW_TARGET_CM = 50;
+const int FOLLOW_TOO_CLOSE_CM = 30;
+const int FOLLOW_LOST_CM = 120;
+const int FOLLOW_MIN_SPEED = 100;
+// Faster than Car 1, or a slightly slower motor would let the gap grow until
+// Car 3 loses sight of it.
+const int FOLLOW_MAX_SPEED = EXPLORE_SPEED + 30;
+const int FOLLOW_BACKOFF_SPEED = 90;
 const uint32_t MOTOR_RAMP_INTERVAL_MS = 20;
 const int MOTOR_ACCEL_STEP = 5;
 const int MOTOR_BRAKE_STEP = 20;
@@ -78,7 +109,9 @@ enum RobotMode
   MODE_LINEFOLLOW = 3,
   MODE_EXPLORE = 4,
   MODE_MAP = 5,
-  MODE_COORDINATE = 6
+  MODE_COORDINATE = 6,
+  // Set only by Car 3: Car 1 turns 180 degrees back the way it came.
+  MODE_TURNAROUND = 7
 };
 
 enum RobotRole
@@ -94,7 +127,8 @@ const bool IS_COORDINATOR = ROBOT_ROLE == ROLE_COORDINATOR;
 enum PacketType
 {
   PACKET_COMMAND = 1,
-  PACKET_TELEMETRY = 2
+  PACKET_TELEMETRY = 2,
+  PACKET_SCAN = 3
 };
 
 enum AvoidancePhase
@@ -111,8 +145,6 @@ enum AvoidancePhase
 };
 
 volatile RobotMode currentMode = MODE_MANUAL;
-volatile int16_t commandedLeft = 0;
-volatile int16_t commandedRight = 0;
 float batteryVoltage = 0.0f;
 int lastObstacleDistanceCm = 999;
 int lastLineTurn = 0;
@@ -120,6 +152,8 @@ AvoidancePhase avoidancePhase = AVOIDANCE_READY;
 uint32_t avoidancePhaseStartedAt = 0;
 int leftScanDistanceCm = 0;
 int rightScanDistanceCm = 0;
+// False until the first real echo; an unplugged sensor never sets it.
+bool ultrasonicHasEchoed = false;
 
 // ESP-NOW protocol. Commands originate only from Car 3; every car broadcasts
 // telemetry so the coordinator can see the team's observations.
@@ -138,6 +172,7 @@ struct __attribute__((packed)) DrivePacket
   int16_t left;
   int16_t right;
   uint8_t mode;
+  uint8_t modeCommandId; // changes on every mode button press, even a repeat
 };
 
 struct __attribute__((packed)) TelemetryPacket
@@ -151,6 +186,20 @@ struct __attribute__((packed)) TelemetryPacket
   uint32_t uptimeMs;
 };
 
+// Car 2's surroundings scan. Directions are relative to Car 2's heading when
+// the scan started, turning right: front, right, back, left.
+const int OBSERVER_SCAN_STEPS = 4;
+
+struct __attribute__((packed)) ScanPacket
+{
+  uint32_t magic;
+  uint8_t type;
+  uint8_t source;
+  uint8_t scanId;   // changes with every new scan
+  uint8_t readings; // directions measured so far, 0-4
+  uint16_t distanceCm[OBSERVER_SCAN_STEPS];
+};
+
 // Motor variables
 int16_t targetLeft = 0;
 int16_t targetRight = 0;
@@ -161,6 +210,8 @@ int16_t appliedRight = 0;
 volatile int16_t receivedLeft = 0;
 volatile int16_t receivedRight = 0;
 volatile RobotMode receivedMode = MODE_IDLE;
+volatile uint8_t receivedModeCommandId = 0;
+uint8_t modeCommandId = 0;
 volatile uint32_t receivedAt = 0;
 
 struct TeamObservation
@@ -172,7 +223,53 @@ struct TeamObservation
 
 TeamObservation teamObservations[4] = {};
 
-uint32_t lastBrowserCommand = 0;
+// Car 2: its own scan in progress. Car 3: the last scan received from Car 2.
+enum ObserverPhase
+{
+  OBSERVER_IDLE,
+  OBSERVER_SETTLE,
+  OBSERVER_TURN,
+  OBSERVER_DONE
+};
+
+ObserverPhase observerPhase = OBSERVER_IDLE;
+uint32_t observerPhaseStartedAt = 0;
+uint8_t observerScanId = 0;
+uint8_t observerReadings = 0;
+uint16_t observerDistanceCm[OBSERVER_SCAN_STEPS] = {};
+
+ScanPacket teamScan = {};
+uint32_t teamScanReceivedAt = 0;
+
+// Car 1: the 180-degree turn-back ordered by Car 3.
+enum TurnaroundPhase
+{
+  TURNAROUND_NONE,
+  TURNAROUND_TURNING,
+  TURNAROUND_DONE
+};
+
+TurnaroundPhase turnaroundPhase = TURNAROUND_NONE;
+uint32_t turnaroundStartedAt = 0;
+
+// Car 3: recovery bookkeeping for a blocked explorer.
+const int MAX_EXPLORER_RECOVERIES = 2;
+const uint32_t EXPLORER_PROGRESS_MS = 8000;
+// Turn time plus margin for the command to arrive and the car to settle.
+const uint32_t TURNAROUND_RESUME_MS = AVOIDANCE_TURN_90_MS * 2 + 800;
+
+int explorerRecoveries = 0;
+bool explorerNeedsOperator = false;
+uint32_t coordinatorPhaseStartedAt = 0;
+
+// Web handlers run in the HTTP server's task: they only leave commands here,
+// under webMux, and loop() applies them.
+portMUX_TYPE webMux = portMUX_INITIALIZER_UNLOCKED;
+int16_t webLeft = 0;
+int16_t webRight = 0;
+uint32_t webCommandAt = 0; // last /drive or /mode from the page
+int pendingMode = -1;      // mode chosen on the page, -1 = none waiting
+
 uint32_t lastRadioSend = 0;
 uint32_t lastTelemetrySend = 0;
 
@@ -292,7 +389,7 @@ void processPacket(const uint8_t *data, int length)
     DrivePacket packet;
     memcpy(&packet, data, sizeof(packet));
 
-    if (packet.mode > MODE_COORDINATE)
+    if (packet.mode > MODE_TURNAROUND)
     {
       return;
     }
@@ -301,6 +398,7 @@ void processPacket(const uint8_t *data, int length)
     receivedLeft = constrain(packet.left, -255, 255);
     receivedRight = constrain(packet.right, -255, 255);
     receivedMode = static_cast<RobotMode>(packet.mode);
+    receivedModeCommandId = packet.modeCommandId;
     receivedAt = millis();
     portEXIT_CRITICAL(&receiveMux);
     return;
@@ -318,6 +416,18 @@ void processPacket(const uint8_t *data, int length)
     teamObservations[packet.source].distanceCm = packet.distanceCm;
     teamObservations[packet.source].blocked = packet.blocked != 0;
     teamObservations[packet.source].receivedAt = millis();
+    portEXIT_CRITICAL(&receiveMux);
+    return;
+  }
+
+  if (header.type == PACKET_SCAN &&
+      IS_COORDINATOR &&
+      header.source == ROLE_MAPPER &&
+      length == static_cast<int>(sizeof(ScanPacket)))
+  {
+    portENTER_CRITICAL(&receiveMux);
+    memcpy(&teamScan, data, sizeof(teamScan));
+    teamScanReceivedAt = millis();
     portEXIT_CRITICAL(&receiveMux);
   }
 }
@@ -361,9 +471,10 @@ long readObstacleDistanceCm()
 
   if (durationUs <= 0)
   {
-    return 999;
+    return ULTRASONIC_NO_ECHO_CM;
   }
 
+  ultrasonicHasEchoed = true;
   return (durationUs * 0.0343f) / 2.0f;
 }
 
@@ -418,12 +529,37 @@ String modeToString(RobotMode mode)
       return "map";
     case MODE_COORDINATE:
       return "coordinate";
+    case MODE_TURNAROUND:
+      return "turnaround";
     default:
       return "manual";
   }
 }
 
 void followLine();
+
+// Car 3 in Explore: keep whatever is directly ahead (Car 1) about
+// FOLLOW_TARGET_CM away. Too close backs off; nothing within FOLLOW_LOST_CM
+// (or no echo) means Car 1 is out of sight, so stop rather than drive blind.
+int followSpeed(int distanceCm)
+{
+  if (distanceCm >= ULTRASONIC_NO_ECHO_CM || distanceCm > FOLLOW_LOST_CM)
+  {
+    return 0;
+  }
+
+  if (distanceCm < FOLLOW_TOO_CLOSE_CM)
+  {
+    return -FOLLOW_BACKOFF_SPEED;
+  }
+
+  if (distanceCm <= FOLLOW_TARGET_CM)
+  {
+    return 0;
+  }
+
+  return map(distanceCm, FOLLOW_TARGET_CM, FOLLOW_LOST_CM, FOLLOW_MIN_SPEED, FOLLOW_MAX_SPEED);
+}
 
 // A role mode gives each car a safe default task without pretending that a
 // single front distance sensor can produce a full SLAM map or localization.
@@ -434,8 +570,14 @@ void applyRoleMode(RobotMode mode, int requestedLeft, int requestedRight)
   {
     if (ROBOT_ROLE == ROLE_EXPLORER)
     {
-      targetLeft = 165;
-      targetRight = 165;
+      targetLeft = EXPLORE_SPEED;
+      targetRight = EXPLORE_SPEED;
+    }
+    else if (ROBOT_ROLE == ROLE_COORDINATOR)
+    {
+      int speed = followSpeed(lastObstacleDistanceCm);
+      targetLeft = speed;
+      targetRight = speed;
     }
     else
     {
@@ -445,7 +587,8 @@ void applyRoleMode(RobotMode mode, int requestedLeft, int requestedRight)
     return;
   }
 
-  if (mode == MODE_MAP || mode == MODE_COORDINATE || mode == MODE_IDLE)
+  if (mode == MODE_MAP || mode == MODE_COORDINATE || mode == MODE_IDLE ||
+      mode == MODE_TURNAROUND)
   {
     targetLeft = 0;
     targetRight = 0;
@@ -536,9 +679,15 @@ void followLine()
 void applyObstacleAvoidance(uint32_t now, int requestedLeft, int requestedRight)
 {
   bool forwardRequested = (requestedLeft + requestedRight) > 0;
-  bool readingValid = lastObstacleDistanceCm >= 2 && lastObstacleDistanceCm <= 400;
-  bool obstacleClose = !readingValid || lastObstacleDistanceCm <= OBSTACLE_DISTANCE_CM;
-  bool pathClear = readingValid && lastObstacleDistanceCm >= OBSTACLE_CLEAR_DISTANCE_CM;
+  // No echo means nothing within range, unless the sensor has never answered
+  // since boot (likely unplugged) - then it must still count as blocked.
+  int distanceCm = lastObstacleDistanceCm;
+  if (distanceCm >= ULTRASONIC_NO_ECHO_CM)
+  {
+    distanceCm = ultrasonicHasEchoed ? ULTRASONIC_MAX_RANGE_CM : 0;
+  }
+  bool obstacleClose = distanceCm <= OBSTACLE_DISTANCE_CM;
+  bool pathClear = distanceCm >= OBSTACLE_CLEAR_DISTANCE_CM;
 
   if (!forwardRequested)
   {
@@ -600,7 +749,7 @@ void applyObstacleAvoidance(uint32_t now, int requestedLeft, int requestedRight)
       targetRight = 0;
       if (now - avoidancePhaseStartedAt >= AVOIDANCE_SETTLE_MS)
       {
-        leftScanDistanceCm = pathClear ? lastObstacleDistanceCm : 0;
+        leftScanDistanceCm = pathClear ? distanceCm : 0;
         avoidancePhase = AVOIDANCE_SCAN_RIGHT;
         avoidancePhaseStartedAt = now;
       }
@@ -622,7 +771,13 @@ void applyObstacleAvoidance(uint32_t now, int requestedLeft, int requestedRight)
       targetRight = 0;
       if (now - avoidancePhaseStartedAt >= AVOIDANCE_SETTLE_MS)
       {
-        rightScanDistanceCm = pathClear ? lastObstacleDistanceCm : 0;
+        rightScanDistanceCm = pathClear ? distanceCm : 0;
+        // Same rule as AVOIDANCE_CHOOSE_PATH; 0 means "not clear".
+        Serial.printf("Scan result: left %d cm, right %d cm -> %s\n",
+                      leftScanDistanceCm, rightScanDistanceCm,
+                      (leftScanDistanceCm == 0 && rightScanDistanceCm == 0) ? "BLOCKED, stopping"
+                      : rightScanDistanceCm >= leftScanDistanceCm          ? "taking RIGHT"
+                                                                           : "taking LEFT");
         avoidancePhase = AVOIDANCE_CHOOSE_PATH;
         avoidancePhaseStartedAt = now;
       }
@@ -666,6 +821,163 @@ void applyObstacleAvoidance(uint32_t now, int requestedLeft, int requestedRight)
       targetLeft = requestedLeft;
       targetRight = requestedRight;
       break;
+  }
+}
+
+// Car 2 in Map mode: measure, turn 90 degrees right, repeat four times, ending
+// at the starting heading. Runs once per Map button press, then holds.
+void updateObserverScan(uint32_t now, RobotMode mode, uint8_t commandId)
+{
+  static uint8_t scannedForCommandId = 0;
+
+  if (mode != MODE_MAP)
+  {
+    observerPhase = OBSERVER_IDLE;
+    return;
+  }
+
+  // Pressing Map again (new command id) starts a fresh scan.
+  if (observerPhase == OBSERVER_IDLE || commandId != scannedForCommandId)
+  {
+    scannedForCommandId = commandId;
+    ++observerScanId;
+    observerReadings = 0;
+    for (int i = 0; i < OBSERVER_SCAN_STEPS; ++i)
+    {
+      observerDistanceCm[i] = 0;
+    }
+    observerPhase = OBSERVER_SETTLE;
+    observerPhaseStartedAt = now;
+  }
+
+  switch (observerPhase)
+  {
+    case OBSERVER_SETTLE:
+      targetLeft = 0;
+      targetRight = 0;
+      if (now - observerPhaseStartedAt >= AVOIDANCE_SETTLE_MS)
+      {
+        // As for Car 1: no echo is open space only if the sensor ever answered.
+        observerDistanceCm[observerReadings] =
+            (lastObstacleDistanceCm >= ULTRASONIC_NO_ECHO_CM && !ultrasonicHasEchoed)
+                ? 0
+                : constrain(lastObstacleDistanceCm, 0, ULTRASONIC_NO_ECHO_CM);
+        ++observerReadings;
+        observerPhase = OBSERVER_TURN;
+        observerPhaseStartedAt = now;
+      }
+      break;
+
+    case OBSERVER_TURN:
+      targetLeft = AVOIDANCE_TURN_SPEED;
+      targetRight = -AVOIDANCE_TURN_SPEED;
+      // Keep turning through this loop; the next phase stops the motors.
+      // Stopping here would cut the turn one loop short.
+      if (now - observerPhaseStartedAt >= AVOIDANCE_TURN_90_MS)
+      {
+        observerPhase = observerReadings < OBSERVER_SCAN_STEPS ? OBSERVER_SETTLE : OBSERVER_DONE;
+        observerPhaseStartedAt = now;
+        if (observerPhase == OBSERVER_DONE)
+        {
+          Serial.printf("Map scan #%d: front %d, right %d, back %d, left %d cm (999 = open)\n",
+                        observerScanId, observerDistanceCm[0], observerDistanceCm[1],
+                        observerDistanceCm[2], observerDistanceCm[3]);
+        }
+      }
+      break;
+
+    default:
+      targetLeft = 0;
+      targetRight = 0;
+      break;
+  }
+}
+
+bool observerScanTurning()
+{
+  return observerPhase == OBSERVER_TURN;
+}
+
+// Car 1 in Turnaround mode: one 180-degree turn per entry, then hold.
+void updateTurnaround(uint32_t now, RobotMode mode)
+{
+  if (mode != MODE_TURNAROUND)
+  {
+    turnaroundPhase = TURNAROUND_NONE;
+    return;
+  }
+
+  if (turnaroundPhase == TURNAROUND_NONE)
+  {
+    turnaroundPhase = TURNAROUND_TURNING;
+    turnaroundStartedAt = now;
+  }
+
+  // The turn starts on the entry loop, so stop on the first loop at or past
+  // the turn time; the motors then run for exactly the elapsed time.
+  if (turnaroundPhase == TURNAROUND_TURNING &&
+      now - turnaroundStartedAt >= AVOIDANCE_TURN_90_MS * 2)
+  {
+    turnaroundPhase = TURNAROUND_DONE;
+  }
+
+  if (turnaroundPhase == TURNAROUND_TURNING)
+  {
+    targetLeft = AVOIDANCE_TURN_SPEED;
+    targetRight = -AVOIDANCE_TURN_SPEED;
+    return;
+  }
+
+  targetLeft = 0;
+  targetRight = 0;
+}
+
+// Car 3: a mode button press starts coordination from a clean state.
+void resetCoordination(uint32_t now)
+{
+  explorerRecoveries = 0;
+  explorerNeedsOperator = false;
+  coordinatorPhaseStartedAt = now;
+}
+
+// Car 3: when Car 1 reports blocked (front, left and right all closed) during
+// Explore, send it back the way it came - the one direction known to be clear -
+// and resume. Give up after MAX_EXPLORER_RECOVERIES without real progress.
+void coordinateExplorer(uint32_t now, bool explorerBlocked, uint32_t explorerReportedAt)
+{
+  if (currentMode == MODE_EXPLORE)
+  {
+    // Ignore a report sent before Explore resumed; it describes the old spot.
+    bool newReport = static_cast<int32_t>(explorerReportedAt - coordinatorPhaseStartedAt) > 0;
+
+    if (explorerBlocked && newReport)
+    {
+      if (explorerRecoveries < MAX_EXPLORER_RECOVERIES)
+      {
+        ++explorerRecoveries;
+        currentMode = MODE_TURNAROUND;
+        Serial.printf("Explorer blocked; turning it back (%d/%d)\n",
+                      explorerRecoveries, MAX_EXPLORER_RECOVERIES);
+      }
+      else
+      {
+        currentMode = MODE_COORDINATE;
+        explorerNeedsOperator = true;
+        Serial.println("Explorer still blocked; team paused for the operator.");
+      }
+      coordinatorPhaseStartedAt = now;
+    }
+    else if (now - coordinatorPhaseStartedAt >= EXPLORER_PROGRESS_MS)
+    {
+      // Explored freely for a while: earlier dead ends no longer count.
+      explorerRecoveries = 0;
+    }
+  }
+  else if (currentMode == MODE_TURNAROUND &&
+           now - coordinatorPhaseStartedAt >= TURNAROUND_RESUME_MS)
+  {
+    currentMode = MODE_EXPLORE;
+    coordinatorPhaseStartedAt = now;
   }
 }
 
@@ -784,9 +1096,30 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
 
   .stats {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 10px;
     margin-top: 12px;
+  }
+
+  .stat { grid-column: span 2; }
+  .stat.wide { grid-column: span 3; }
+  .stat-value.offline { color: var(--muted); }
+  .stat-value.blocked { color: var(--danger); }
+  .stat-value.open { color: var(--ok); }
+
+  .scan {
+    margin-top: 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 10px 8px;
+    text-align: center;
+  }
+
+  .scan-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
   }
 
   .stat {
@@ -932,20 +1265,30 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
           <span id="batteryValue" class="stat-value">N/A</span>
         </div>
         <div class="stat">
-          <span class="stat-label">Obstacle</span>
-          <span id="obstacleValue" class="stat-value">-- cm</span>
-        </div>
-        <div class="stat">
           <span class="stat-label">Mode</span>
           <span id="modeValue" class="stat-value">Manual</span>
         </div>
         <div class="stat">
-          <span class="stat-label">Control car</span>
-          <span id="roleValue" class="stat-value">Coordinator</span>
+          <span class="stat-label">Car 3 Coordinator</span>
+          <span id="obstacleValue" class="stat-value">-- cm</span>
         </div>
-        <div class="stat">
-          <span class="stat-label">Team links</span>
-          <span id="teamValue" class="stat-value">--</span>
+        <div class="stat wide">
+          <span class="stat-label">Car 1 Explorer</span>
+          <span id="car1Value" class="stat-value">--</span>
+        </div>
+        <div class="stat wide">
+          <span class="stat-label">Car 2 Observer</span>
+          <span id="car2Value" class="stat-value">--</span>
+        </div>
+      </div>
+
+      <div class="scan">
+        <span class="stat-label">Car 2 scan, relative to its heading - <b id="scanState">press Map to scan</b></span>
+        <div class="scan-grid">
+          <div><span class="stat-label">Front</span><span class="scan-cell stat-value">--</span></div>
+          <div><span class="stat-label">Right</span><span class="scan-cell stat-value">--</span></div>
+          <div><span class="stat-label">Back</span><span class="scan-cell stat-value">--</span></div>
+          <div><span class="stat-label">Left</span><span class="scan-cell stat-value">--</span></div>
         </div>
       </div>
     </div>
@@ -980,8 +1323,10 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
 
       <div class="info">
         Drag the joystick or use WASD / Arrow keys.<br>
-        Car 1 stops at 35 cm, reverses slowly, then scans left and right before choosing a path with at least 60 cm clear.<br>
-        If neither direction is clear, it stays stopped and reports blocked.<br>
+        <b>Explore:</b> Car 1 drives; at 35 cm it reverses, scans left and right, and takes a path with 60 cm clear.
+        If none is clear, Car 3 turns it back (up to 2 times) before pausing the team. Car 3 follows Car 1 at about 50 cm.<br>
+        <b>Map:</b> Car 2 measures front, right, back and left; press Map again to rescan.<br>
+        All missions stop if this page is closed for 2 seconds.<br>
         Battery cutoff stays disabled until a voltage divider is installed and enabled.
       </div>
     </div>
@@ -994,8 +1339,10 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
     const batteryValue = document.getElementById('batteryValue');
     const obstacleValue = document.getElementById('obstacleValue');
     const modeValue = document.getElementById('modeValue');
-    const roleValue = document.getElementById('roleValue');
-    const teamValue = document.getElementById('teamValue');
+    const car1Value = document.getElementById('car1Value');
+    const car2Value = document.getElementById('car2Value');
+    const scanState = document.getElementById('scanState');
+    const scanCells = [...document.querySelectorAll('.scan-cell')];
     const joystickEl = document.getElementById('joystick');
     const stickEl = document.getElementById('stick');
     const modeButtons = [...document.querySelectorAll('.mode-btn')];
@@ -1004,6 +1351,9 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
     let busy = false;
     let pendingDrive = null;
     let driveError = false;
+    let driveFailures = 0;
+    let statusBusy = false;
+    let modeChangedAt = 0;
     let stickState = { active: false, x: 0, y: 0 };
     let keys = new Set();
 
@@ -1018,10 +1368,50 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
       KeyD: 'right'
     };
 
-    function setMode(mode) {
+    function showMode(mode) {
       activeMode = mode;
       modeButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.mode === mode));
       modeValue.textContent = mode === 'line' ? 'Line' : mode.charAt(0).toUpperCase() + mode.slice(1);
+    }
+
+    // 999 cm means no echo: nothing within the sensor's ~4 m range.
+    function formatDistance(cm) {
+      return cm >= 999 ? 'open' : cm + ' cm';
+    }
+
+    function showTeammate(el, car) {
+      if (!car) return;
+      let text = 'offline';
+      let state = 'offline';
+      if (car.online) {
+        text = car.blocked ? 'blocked' : formatDistance(car.distance);
+        state = car.blocked ? 'blocked' : '';
+      }
+      el.textContent = text;
+      el.className = 'stat-value ' + state;
+    }
+
+    // A direction is open when it is at least as far as Car 1 needs to pass.
+    function showScan(stateEl, cells, scan, clearCm) {
+      if (!scan) return;
+      stateEl.textContent = scan.readings < cells.length
+        ? 'scanning ' + scan.readings + '/' + cells.length
+        : 'scan #' + scan.id;
+      cells.forEach((cell, i) => {
+        if (i >= scan.readings) {
+          cell.textContent = '...';
+          cell.className = 'scan-cell stat-value offline';
+          return;
+        }
+        const cm = scan.cm[i];
+        cell.textContent = formatDistance(cm);
+        cell.className = 'scan-cell stat-value ' + (cm >= clearCm ? 'open' : 'blocked');
+      });
+    }
+
+    function setMode(mode) {
+      showMode(mode);
+      modeChangedAt = Date.now();
       fetch('/mode?m=' + mode, { cache: 'no-store' });
       if (mode === 'idle') {
         updateDrive(0, 0);
@@ -1060,7 +1450,7 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
     }
 
     function updateDrive(left, right) {
-      pendingDrive = { left, right, mode: activeMode };
+      pendingDrive = { left, right };
       sendPendingDrive();
     }
 
@@ -1072,13 +1462,14 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 400);
 
-      fetch('/drive?l=' + Math.round(command.left) + '&r=' + Math.round(command.right) + '&m=' + command.mode, {
+      fetch('/drive?l=' + Math.round(command.left) + '&r=' + Math.round(command.right), {
         cache: 'no-store',
         signal: controller.signal
       })
       .then(resp => resp.text())
       .then(text => {
         if (text && text.trim() === 'OK') {
+          driveFailures = 0;
           driveError = false;
           status.textContent = 'Connected - motors active';
           status.className = 'status';
@@ -1089,9 +1480,14 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
         }
       })
       .catch(() => {
-        driveError = true;
-        status.textContent = 'Connection problem - motors should stop';
-        status.className = 'status danger';
+        // One slow reply is harmless: the car keeps the last command for
+        // 0.8 s. Only two failures in a row mean the link is really down.
+        driveFailures++;
+        if (driveFailures >= 2) {
+          driveError = true;
+          status.textContent = 'Connection problem - motors should stop';
+          status.className = 'status danger';
+        }
       })
       .finally(() => {
         clearTimeout(timeout);
@@ -1138,7 +1534,8 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
       const ny = Math.sin(angle) * distance / 68;
       stickState.active = true;
       stickState.x = nx;
-      stickState.y = -ny;
+      // Screen Y grows downward; currentAxes() turns "up" into forward.
+      stickState.y = ny;
       updateStick();
       sendCurrentAxes();
     }
@@ -1196,8 +1593,15 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
       sendCurrentAxes();
     });
 
-    setInterval(() => {
-      fetch('/status', { cache: 'no-store' })
+    // One status request at a time: piled-up requests use up the browser's
+    // connections to the car and delay the drive commands behind them.
+    function pollStatus() {
+      if (statusBusy) return;
+      statusBusy = true;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1000);
+
+      fetch('/status', { cache: 'no-store', signal: controller.signal })
         .then(r => r.json())
         .then(data => {
           if (!data.batteryEnabled) {
@@ -1205,17 +1609,27 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
           } else if (typeof data.battery === 'number') {
             batteryValue.textContent = Number(data.battery).toFixed(1) + 'V';
           }
-          if (typeof data.distance === 'number') obstacleValue.textContent = data.distance + ' cm';
-          if (data.mode) modeValue.textContent = data.mode === 'line' ? 'Line' : data.mode.charAt(0).toUpperCase() + data.mode.slice(1);
-          if (data.role) roleValue.textContent = data.role;
-          if (data.team) teamValue.textContent = data.team;
+          if (typeof data.distance === 'number') obstacleValue.textContent = formatDistance(data.distance);
+          // Follow mode changes made by the car itself (e.g. auto-pause), but
+          // not a stale reply that raced a button press.
+          if (data.mode && data.mode !== activeMode && Date.now() - modeChangedAt > 1000) showMode(data.mode);
+          showTeammate(car1Value, data.c1);
+          showTeammate(car2Value, data.c2);
+          showScan(scanState, scanCells, data.c2scan, data.clearCm);
           if (data.status && (data.warn || !driveError)) {
             status.textContent = data.status;
             status.className = 'status ' + (data.warn ? 'warning' : '');
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          clearTimeout(timeout);
+          statusBusy = false;
+        });
+    }
 
+    setInterval(() => {
+      pollStatus();
       if (!document.hidden) {
         sendCurrentAxes();
       }
@@ -1229,11 +1643,353 @@ const char PAGE[] PROGMEM = R"SWARMHTML(
 </html>
 )SWARMHTML";
 
+// One teammate's latest telemetry for the dashboard's /status reply.
+String teamObservationJson(const TeamObservation &car, uint32_t now)
+{
+  bool online = car.receivedAt != 0 &&
+                now - car.receivedAt <= TEAM_TELEMETRY_TIMEOUT_MS;
+  return String("{\"online\":") + (online ? "true" : "false") +
+         ",\"distance\":" + String(car.distanceCm) +
+         ",\"blocked\":" + (car.blocked ? "true" : "false") + "}";
+}
+
+// Car 2's latest scan for /status, or null if none has arrived yet.
+String scanJson(const ScanPacket &scan, uint32_t receivedAt)
+{
+  if (receivedAt == 0)
+  {
+    return "null";
+  }
+
+  String json = String("{\"id\":") + String(scan.scanId) +
+                ",\"readings\":" + String(scan.readings) + ",\"cm\":[";
+  for (int i = 0; i < OBSERVER_SCAN_STEPS; ++i)
+  {
+    if (i > 0)
+    {
+      json += ",";
+    }
+    json += String(scan.distanceCm[i]);
+  }
+  return json + "]}";
+}
+
+// ---- Car 3 web server ----
+
+// Copies one query parameter (e.g. "l" from /drive?l=100) into value.
+bool queryValue(httpd_req_t *req, const char *key, char *value, size_t size)
+{
+  char query[64];
+  return httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+         httpd_query_key_value(query, key, value, size) == ESP_OK;
+}
+
+esp_err_t sendResponse(httpd_req_t *req, const char *status, const char *type,
+                       const char *body, ssize_t length = HTTPD_RESP_USE_STRLEN)
+{
+  httpd_resp_set_status(req, status);
+  httpd_resp_set_type(req, type);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, body, length);
+}
+
+esp_err_t handleRoot(httpd_req_t *req)
+{
+  return sendResponse(req, "200 OK", "text/html", PAGE);
+}
+
+// Motor command from the page. Mode changes only through /mode, so a periodic
+// drive command cannot undo the coordinator's automatic pause.
+esp_err_t handleDrive(httpd_req_t *req)
+{
+  char left[8];
+  char right[8];
+  if (!queryValue(req, "l", left, sizeof(left)) ||
+      !queryValue(req, "r", right, sizeof(right)))
+  {
+    return sendResponse(req, "400 Bad Request", "text/plain", "Missing command");
+  }
+
+  int16_t leftSpeed = constrain(atoi(left), -255, 255);
+  int16_t rightSpeed = constrain(atoi(right), -255, 255);
+
+  portENTER_CRITICAL(&webMux);
+  webLeft = leftSpeed;
+  webRight = rightSpeed;
+  webCommandAt = millis();
+  portEXIT_CRITICAL(&webMux);
+
+  return sendResponse(req, "200 OK", "text/plain", "OK");
+}
+
+esp_err_t handleMode(httpd_req_t *req)
+{
+  char modeText[16];
+  if (!queryValue(req, "m", modeText, sizeof(modeText)))
+  {
+    return sendResponse(req, "400 Bad Request", "text/plain", "Missing mode");
+  }
+
+  RobotMode mode = parseMode(String(modeText));
+
+  portENTER_CRITICAL(&webMux);
+  pendingMode = mode;
+  webCommandAt = millis();
+  portEXIT_CRITICAL(&webMux);
+
+  return sendResponse(req, "200 OK", "text/plain", modeToString(mode).c_str());
+}
+
+esp_err_t handleStatus(httpd_req_t *req)
+{
+  // Copy under the lock; build Strings only after releasing it.
+  TeamObservation explorer;
+  TeamObservation mapper;
+  ScanPacket scan;
+  uint32_t scanReceivedAt;
+  portENTER_CRITICAL(&receiveMux);
+  uint32_t now = millis();
+  explorer = teamObservations[ROLE_EXPLORER];
+  mapper = teamObservations[ROLE_MAPPER];
+  scan = teamScan;
+  scanReceivedAt = teamScanReceivedAt;
+  portEXIT_CRITICAL(&receiveMux);
+
+  String payload = "{\"batteryEnabled\":" +
+                   String(BATTERY_MONITOR_ENABLED ? "true" : "false") +
+                   ",\"battery\":" +
+                   (BATTERY_MONITOR_ENABLED ? String(batteryVoltage, 1) : String("null")) +
+                   ",\"distance\":" + String(lastObstacleDistanceCm) +
+                   ",\"mode\":\"" + modeToString(currentMode) +
+                   "\",\"role\":\"Coordinator\"" +
+                   ",\"c1\":" + teamObservationJson(explorer, now) +
+                   ",\"c2\":" + teamObservationJson(mapper, now) +
+                   ",\"c2scan\":" + scanJson(scan, scanReceivedAt) +
+                   ",\"clearCm\":" + String(OBSTACLE_CLEAR_DISTANCE_CM) +
+                   ",\"avoidance\":\"" + avoidancePhaseToString() + "\"";
+
+  if (BATTERY_MONITOR_ENABLED && batteryVoltage < BATTERY_LOW_VOLTAGE)
+  {
+    payload += ",\"warn\":true,\"status\":\"Low battery - motors disabled\"";
+  }
+  else if (explorerNeedsOperator)
+  {
+    payload += ",\"warn\":true,\"status\":\"Car 1 still blocked after " +
+               String(MAX_EXPLORER_RECOVERIES) +
+               " turn-backs - team paused, choose a mode\"";
+  }
+  else if (currentMode == MODE_TURNAROUND)
+  {
+    payload += ",\"warn\":false,\"status\":\"Car 1 blocked - turning it back (" +
+               String(explorerRecoveries) + "/" + String(MAX_EXPLORER_RECOVERIES) + ")\"";
+  }
+  else if (avoidancePhase == AVOIDANCE_LOCKED)
+  {
+    payload += ",\"warn\":true,\"status\":\"Blocked - no safe direction\"";
+  }
+  else if (avoidancePhase != AVOIDANCE_READY)
+  {
+    payload += ",\"warn\":false,\"status\":\"" + avoidancePhaseToString() + "\"";
+  }
+  else
+  {
+    payload += ",\"warn\":false,\"status\":\"Connected - motors active\"";
+  }
+
+  payload += "}";
+  return sendResponse(req, "200 OK", "application/json", payload.c_str(), payload.length());
+}
+
+esp_err_t handleNotFound(httpd_req_t *req, httpd_err_code_t)
+{
+  return sendResponse(req, "404 Not Found", "text/plain", "Not found");
+}
+
+void startWebServer()
+{
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  // When all sockets are busy, close the least recently used one (such as an
+  // idle connection the browser opened in advance) instead of refusing.
+  config.lru_purge_enable = true;
+  config.recv_wait_timeout = 2;
+  config.send_wait_timeout = 2;
+  config.stack_size = 8192; // /status builds its reply with String
+
+  if (httpd_start(&httpServer, &config) != ESP_OK)
+  {
+    Serial.println("Web server failed to start; dashboard unavailable.");
+    return;
+  }
+
+  const httpd_uri_t routes[] = {
+      {"/", HTTP_GET, handleRoot, nullptr},
+      {"/drive", HTTP_GET, handleDrive, nullptr},
+      {"/mode", HTTP_GET, handleMode, nullptr},
+      {"/status", HTTP_GET, handleStatus, nullptr},
+  };
+  for (const httpd_uri_t &route : routes)
+  {
+    httpd_register_uri_handler(httpServer, &route);
+  }
+  httpd_register_err_handler(httpServer, HTTPD_404_NOT_FOUND, handleNotFound);
+}
+
+// Home Wi-Fi diagnostics, so a failed join says why instead of guessing.
+volatile uint8_t homeWifiDisconnectReason = 0;
+
+const char *wifiReasonText(uint8_t reason)
+{
+  switch (reason)
+  {
+    case 0:
+      return "no disconnect reported";
+    case WIFI_REASON_AUTH_EXPIRE:
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      return "rejected - wrong password, or the network needs a username";
+    case WIFI_REASON_NO_AP_FOUND:
+      return "network not found - name wrong, out of range, or 5 GHz only";
+    case WIFI_REASON_ASSOC_FAIL:
+    case WIFI_REASON_ASSOC_EXPIRE:
+      return "router refused the connection";
+    case WIFI_REASON_BEACON_TIMEOUT:
+      return "signal lost - too far from the router";
+    default:
+      return "see ESP-IDF wifi_err_reason_t";
+  }
+}
+
+const char *wifiAuthText(wifi_auth_mode_t auth)
+{
+  switch (auth)
+  {
+    case WIFI_AUTH_OPEN:
+      return "open";
+    case WIFI_AUTH_WEP:
+      return "WEP";
+    case WIFI_AUTH_WPA_PSK:
+    case WIFI_AUTH_WPA2_PSK:
+    case WIFI_AUTH_WPA_WPA2_PSK:
+      return "password (WPA/WPA2)";
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+      return "ENTERPRISE (username + password)";
+    case WIFI_AUTH_WPA3_PSK:
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+      return "password (WPA3)";
+    default:
+      return "other";
+  }
+}
+
+// List every 2.4 GHz network Car 3 can see and say whether the configured one
+// is among them. The ESP32 cannot see 5 GHz networks at all.
+void reportHomeWifiScan()
+{
+  Serial.println("Scanning for Wi-Fi networks...");
+  int found = WiFi.scanNetworks();
+  bool seen = false;
+
+  for (int i = 0; i < found; ++i)
+  {
+    bool match = WiFi.SSID(i) == HOME_WIFI_SSID;
+    seen = seen || match;
+    Serial.printf("  %s \"%s\"  channel %d  signal %d dBm  %s\n",
+                  match ? ">>" : "  ", WiFi.SSID(i).c_str(), WiFi.channel(i),
+                  WiFi.RSSI(i), wifiAuthText(WiFi.encryptionType(i)));
+  }
+
+  if (!seen)
+  {
+    Serial.printf("\"%s\" is NOT visible: check the exact name (spaces, capitals), "
+                  "or it is 5 GHz only / out of range.\n",
+                  HOME_WIFI_SSID);
+  }
+
+  WiFi.scanDelete();
+}
+
+// ---- Running from the car battery ----
+// Starting the Wi-Fi radio draws a short ~0.5 A spike. On USB that is easy;
+// through the car's battery and regulator it can dip the voltage, the
+// brownout detector restarts the chip, and Wi-Fi never stays up.
+
+const int STATUS_LED_PIN = 2; // on-board blue LED: blinks while starting, on when Wi-Fi is ready
+const uint32_t POWER_SETTLE_MS = 500;
+const wifi_power_t WIFI_TX_POWER = WIFI_POWER_11dBm; // lower peak current; still covers a room
+const int RESET_HISTORY_LENGTH = 5;
+
+void setStatusLed(bool on)
+{
+  digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
+}
+
+void blinkStatusLed()
+{
+  digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
+}
+
+void limitWifiPower()
+{
+  WiFi.setTxPower(WIFI_TX_POWER);
+}
+
+const char *resetReasonText(uint8_t reason)
+{
+  switch (reason)
+  {
+    case ESP_RST_POWERON:
+      return "power-on";
+    case ESP_RST_EXT:
+      return "reset button";
+    case ESP_RST_SW:
+      return "software";
+    case ESP_RST_PANIC:
+      return "crash";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+      return "watchdog";
+    case ESP_RST_BROWNOUT:
+      return "BROWNOUT (power dip)";
+    default:
+      return "other";
+  }
+}
+
+// Keeps the last few restart reasons in flash, so restarts that happened on
+// battery, with no laptop attached, can be read on the next USB connection.
+void reportResetHistory()
+{
+  Preferences prefs;
+  prefs.begin("swarmx", false);
+  uint32_t boots = prefs.getUInt("boots", 0) + 1;
+  uint8_t history[RESET_HISTORY_LENGTH] = {};
+  prefs.getBytes("resets", history, sizeof(history));
+  memmove(history + 1, history, RESET_HISTORY_LENGTH - 1);
+  history[0] = static_cast<uint8_t>(esp_reset_reason());
+  prefs.putUInt("boots", boots);
+  prefs.putBytes("resets", history, sizeof(history));
+  prefs.end();
+
+  Serial.printf("Boot #%lu. Restart reasons, newest first:", static_cast<unsigned long>(boots));
+  for (int i = 0; i < RESET_HISTORY_LENGTH && history[i] != 0; ++i)
+  {
+    Serial.printf(" [%s]", resetReasonText(history[i]));
+  }
+  Serial.println();
+}
+
 // ESP32 setup
 void setup()
 {
+  // A short voltage dip from the Wi-Fi start-up spike must not restart the car.
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  setStatusLed(false);
+  reportResetHistory();
 
   pinMode(BATTERY_PIN, INPUT);
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
@@ -1271,7 +2027,10 @@ void setup()
   // Cars 1 and 2 join the Car 3 access point.
   if (IS_COORDINATOR)
   {
+    // Let the battery supply settle after power-on before the radio starts.
+    delay(POWER_SETTLE_MS);
     WiFi.mode(WIFI_AP_STA);
+    limitWifiPower();
     WiFi.setSleep(false);
 
     if (!WiFi.softAP(AP_NAME, AP_PASSWORD, RADIO_CHANNEL))
@@ -1284,13 +2043,21 @@ void setup()
       }
     }
 
+    limitWifiPower();
+    setStatusLed(true); // SWARM-X is up
     Serial.printf("Operator Wi-Fi: %s\n", AP_NAME);
     Serial.print("Dashboard on SWARM-X: http://");
     Serial.println(WiFi.softAPIP());
 
     if (strlen(HOME_WIFI_SSID) > 0 && strlen(HOME_WIFI_PASSWORD) > 0)
     {
-      Serial.println("Connecting Car 3 to home Wi-Fi...");
+      reportHomeWifiScan();
+
+      WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info)
+                   { homeWifiDisconnectReason = info.wifi_sta_disconnected.reason; },
+                   ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+      Serial.printf("Connecting Car 3 to \"%s\"...\n", HOME_WIFI_SSID);
       WiFi.begin(HOME_WIFI_SSID, HOME_WIFI_PASSWORD);
       uint32_t connectStartedAt = millis();
       while (WiFi.status() != WL_CONNECTED &&
@@ -1306,7 +2073,10 @@ void setup()
       }
       else
       {
-        Serial.println("Home Wi-Fi unavailable; SWARM-X operator Wi-Fi remains active.");
+        Serial.printf("Home Wi-Fi failed: status %d, reason %d (%s)\n",
+                      static_cast<int>(WiFi.status()), homeWifiDisconnectReason,
+                      wifiReasonText(homeWifiDisconnectReason));
+        Serial.println("SWARM-X operator Wi-Fi remains active.");
       }
     }
     else
@@ -1316,31 +2086,32 @@ void setup()
   }
   else
   {
+    delay(POWER_SETTLE_MS);
     WiFi.mode(WIFI_STA);
+    limitWifiPower();
     WiFi.setSleep(false);
-    WiFi.begin(AP_NAME, AP_PASSWORD);
+    WiFi.setAutoReconnect(true);
 
-    uint32_t connectStartedAt = millis();
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - connectStartedAt < WIFI_CONNECT_TIMEOUT_MS)
+    // Car 3 may power up later than this car, so keep trying instead of
+    // giving up. Motors are already stopped above.
+    while (WiFi.status() != WL_CONNECTED)
     {
-      delay(250);
-    }
+      Serial.printf("Car %d joining %s...\n", ROBOT_ID, AP_NAME);
+      WiFi.disconnect();
+      WiFi.begin(AP_NAME, AP_PASSWORD);
 
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      Serial.printf("Car %d joined %s on channel %ld\n",
-                    ROBOT_ID, AP_NAME, static_cast<long>(WiFi.channel()));
-    }
-    else
-    {
-      Serial.println("Could not join SWARM-X Wi-Fi; motors remain stopped.");
-      while (true)
+      uint32_t connectStartedAt = millis();
+      while (WiFi.status() != WL_CONNECTED &&
+             millis() - connectStartedAt < WIFI_CONNECT_TIMEOUT_MS)
       {
-        drive(0, 0);
-        delay(1000);
+        delay(250);
+        blinkStatusLed(); // searching for SWARM-X
       }
     }
+
+    setStatusLed(true);
+    Serial.printf("Car %d joined %s on channel %ld\n",
+                  ROBOT_ID, AP_NAME, static_cast<long>(WiFi.channel()));
   }
 
   // Start ESP-NOW
@@ -1388,117 +2159,7 @@ void setup()
     // Only Car 3 exposes mission controls; it is the team's coordinator.
     if (IS_COORDINATOR)
     {
-    // Web dashboard
-    server.on("/", HTTP_GET, []()
-              { server.send_P(
-                    200,
-                    "text/html",
-                    PAGE); });
-
-    // Receive motor commands from laptop
-    server.on("/drive", HTTP_GET, []()
-              {
-                if (!server.hasArg("l") ||
-                    !server.hasArg("r"))
-                {
-
-                  server.send(
-                      400,
-                      "text/plain",
-                      "Missing command");
-
-                  return;
-                }
-
-                commandedLeft = constrain(
-                    server.arg("l").toInt(),
-                    -255,
-                    255);
-
-                commandedRight = constrain(
-                    server.arg("r").toInt(),
-                    -255,
-                    255);
-
-                if (server.hasArg("m"))
-                {
-                  currentMode = parseMode(server.arg("m"));
-                }
-
-                lastBrowserCommand = millis();
-
-                Serial.printf(
-                    "HTTP drive L:%d R:%d mode=%s\n",
-                    commandedLeft,
-                    commandedRight,
-                    modeToString(currentMode).c_str());
-
-                server.send(
-                    200,
-                    "text/plain",
-                    "OK"); });
-
-    server.on("/mode", HTTP_GET, []()
-              {
-                if (!server.hasArg("m"))
-                {
-                  server.send(400, "text/plain", "Missing mode");
-                  return;
-                }
-
-                currentMode = parseMode(server.arg("m"));
-                lastBrowserCommand = millis();
-                server.send(200, "text/plain", modeToString(currentMode)); });
-
-    server.on("/status", HTTP_GET, []()
-              {
-                uint32_t now = millis();
-                bool explorerOnline;
-                bool mapperOnline;
-                portENTER_CRITICAL(&receiveMux);
-                explorerOnline = now - teamObservations[ROLE_EXPLORER].receivedAt <= TELEMETRY_INTERVAL_MS * 3;
-                mapperOnline = now - teamObservations[ROLE_MAPPER].receivedAt <= TELEMETRY_INTERVAL_MS * 3;
-                portEXIT_CRITICAL(&receiveMux);
-                String team = String("C1 ") + (explorerOnline ? "online" : "offline") +
-                              ", C2 " + (mapperOnline ? "online" : "offline");
-                String payload = "{\"batteryEnabled\":" +
-                                 String(BATTERY_MONITOR_ENABLED ? "true" : "false") +
-                                 ",\"battery\":" +
-                                 (BATTERY_MONITOR_ENABLED ? String(batteryVoltage, 1) : String("null")) +
-                                 ",\"distance\":" + String(lastObstacleDistanceCm) +
-                                 ",\"mode\":\"" + modeToString(currentMode) +
-                                 "\",\"role\":\"Coordinator\"" +
-                                 ",\"team\":\"" + team +
-                                 "\",\"avoidance\":\"" + avoidancePhaseToString() + "\"";
-
-                if (BATTERY_MONITOR_ENABLED && batteryVoltage < BATTERY_LOW_VOLTAGE)
-                {
-                  payload += ",\"warn\":true,\"status\":\"Low battery - motors disabled\"";
-                }
-                else if (avoidancePhase == AVOIDANCE_LOCKED)
-                {
-                  payload += ",\"warn\":true,\"status\":\"Blocked - no safe direction\"";
-                }
-                else if (avoidancePhase != AVOIDANCE_READY)
-                {
-                  payload += ",\"warn\":false,\"status\":\"" + avoidancePhaseToString() + "\"";
-                }
-                else
-                {
-                  payload += ",\"warn\":false,\"status\":\"Connected - motors active\"";
-                }
-
-                payload += "}";
-                server.send(200, "application/json", payload);
-              });
-
-    server.onNotFound([]()
-                      { server.send(
-                            404,
-                            "text/plain",
-                            "Not found"); });
-
-    server.begin();
+      startWebServer();
     }
   }
 
@@ -1537,36 +2198,62 @@ void loop()
   int16_t requestedLeft = 0;
   int16_t requestedRight = 0;
   RobotMode activeMode = MODE_IDLE;
+  uint8_t activeModeCommandId = modeCommandId;
 
   if (IS_COORDINATOR)
   {
-    server.handleClient();
-    bool explorerBlocked;
-    portENTER_CRITICAL(&receiveMux);
-    explorerBlocked = teamObservations[ROLE_EXPLORER].blocked;
-    portEXIT_CRITICAL(&receiveMux);
+    int16_t webLeftNow;
+    int16_t webRightNow;
+    uint32_t webCommandAtNow;
+    int newMode;
+    portENTER_CRITICAL(&webMux);
+    webLeftNow = webLeft;
+    webRightNow = webRight;
+    webCommandAtNow = webCommandAt;
+    newMode = pendingMode;
+    pendingMode = -1;
+    portEXIT_CRITICAL(&webMux);
+    // Read after the timestamp, so it can never be older and wrap around.
+    now = millis();
+    uint32_t sinceWebCommand = now - webCommandAtNow;
 
-    // A blocked scout is a team event: pause the mission so the coordinator
-    // can select another route instead of allowing overlap or blind motion.
-    if (currentMode == MODE_EXPLORE && explorerBlocked)
+    if (newMode >= 0)
     {
-      currentMode = MODE_COORDINATE;
-      commandedLeft = 0;
-      commandedRight = 0;
+      currentMode = static_cast<RobotMode>(newMode);
+      ++modeCommandId;
+      resetCoordination(now);
     }
 
-    activeMode = currentMode;
-    if (now - lastBrowserCommand <= CONTROL_TIMEOUT_MS)
+    if (currentMode != MODE_IDLE && sinceWebCommand > OPERATOR_TIMEOUT_MS)
     {
-      requestedLeft = commandedLeft;
-      requestedRight = commandedRight;
+      currentMode = MODE_IDLE;
+      Serial.println("Operator page silent; team switched to Idle.");
+    }
+
+    bool explorerBlocked;
+    uint32_t explorerReportedAt;
+    portENTER_CRITICAL(&receiveMux);
+    explorerBlocked = teamObservations[ROLE_EXPLORER].blocked;
+    explorerReportedAt = teamObservations[ROLE_EXPLORER].receivedAt;
+    portEXIT_CRITICAL(&receiveMux);
+    // Only act on a fresh report; an offline explorer's last flag is stale.
+    explorerBlocked = explorerBlocked &&
+                      millis() - explorerReportedAt <= TEAM_TELEMETRY_TIMEOUT_MS;
+
+    coordinateExplorer(now, explorerBlocked, explorerReportedAt);
+
+    activeMode = currentMode;
+    if (sinceWebCommand <= CONTROL_TIMEOUT_MS)
+    {
+      requestedLeft = webLeftNow;
+      requestedRight = webRightNow;
     }
 
     if (now - lastRadioSend >= RADIO_INTERVAL_MS)
     {
       DrivePacket packet = {PACKET_MAGIC, PACKET_COMMAND, ROBOT_ID,
                             requestedLeft, requestedRight,
-                            static_cast<uint8_t>(activeMode)};
+                            static_cast<uint8_t>(activeMode), modeCommandId};
       esp_now_send(broadcastMac, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
       lastRadioSend = now;
     }
@@ -1578,11 +2265,14 @@ void loop()
     requestedLeft = receivedLeft;
     requestedRight = receivedRight;
     activeMode = receivedMode;
+    activeModeCommandId = receivedModeCommandId;
     receivedTime = receivedAt;
     portEXIT_CRITICAL(&receiveMux);
 
     // A missing coordinator is always a stop, not a continuation of a mission.
-    if (now - receivedTime > CONTROL_TIMEOUT_MS)
+    // Use a fresh millis(): receivedAt may be newer than "now", which was read
+    // before pulseIn, and the subtraction would wrap around.
+    if (millis() - receivedTime > CONTROL_TIMEOUT_MS)
     {
       activeMode = MODE_IDLE;
       requestedLeft = 0;
@@ -1599,7 +2289,8 @@ void loop()
   else
   {
     applyRoleMode(activeMode, requestedLeft, requestedRight);
-    if (activeMode != MODE_IDLE && activeMode != MODE_MAP && activeMode != MODE_COORDINATE)
+    if (activeMode != MODE_IDLE && activeMode != MODE_MAP && activeMode != MODE_COORDINATE &&
+        activeMode != MODE_TURNAROUND)
     {
       int requestedRoleLeft = targetLeft;
       int requestedRoleRight = targetRight;
@@ -1609,9 +2300,21 @@ void loop()
     {
       avoidancePhase = AVOIDANCE_READY;
     }
+
+    if (ROBOT_ROLE == ROLE_MAPPER)
+    {
+      updateObserverScan(now, activeMode, activeModeCommandId);
+    }
+
+    if (ROBOT_ROLE == ROLE_EXPLORER)
+    {
+      updateTurnaround(now, activeMode);
+    }
   }
 
-  if (avoidanceNeedsImmediateDrive())
+  // Timed turns must not be stretched by the speed ramp.
+  if (avoidanceNeedsImmediateDrive() || observerScanTurning() ||
+      turnaroundPhase == TURNAROUND_TURNING)
   {
     driveImmediately(targetLeft, targetRight);
   }
@@ -1627,7 +2330,22 @@ void loop()
                               static_cast<uint16_t>(constrain(lastObstacleDistanceCm, 0, 999)),
                               static_cast<uint8_t>(avoidancePhase == AVOIDANCE_LOCKED), now};
     esp_now_send(broadcastMac, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
+
+    // Repeat the scan on every telemetry tick so a lost packet is replaced.
+    if (ROBOT_ROLE == ROLE_MAPPER && observerReadings > 0)
+    {
+      ScanPacket scan = {PACKET_MAGIC, PACKET_SCAN, ROBOT_ID, observerScanId, observerReadings, {}};
+      memcpy(scan.distanceCm, observerDistanceCm, sizeof(scan.distanceCm));
+      esp_now_send(broadcastMac, reinterpret_cast<uint8_t *>(&scan), sizeof(scan));
+    }
+
     lastTelemetrySend = now;
+  }
+
+  // Cars 1 and 2: the blue LED shows whether they are still on SWARM-X.
+  if (!IS_COORDINATOR)
+  {
+    setStatusLed(WiFi.status() == WL_CONNECTED);
   }
 
   delay(5);
